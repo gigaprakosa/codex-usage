@@ -17,6 +17,8 @@ TOKEN_KEYS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
 
 
 def stamp(value):
+    if not isinstance(value, str):
+        raise ValueError('timestamp must be text')
     return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone()
 
 
@@ -96,6 +98,9 @@ def candidates(rows, meta, warnings):
         if not modern and not legacy:
             continue
         info = payload.get('info') or {}
+        if not isinstance(info, dict):
+            warnings.append('invalid token metadata skipped')
+            continue
         usage = payload.get('usage') if modern else info.get('last_token_usage')
         total = payload.get('thread_token_usage') if modern else info.get('total_token_usage')
         if usage is None:
@@ -157,9 +162,19 @@ def read_usage(home, warnings):
 def select_rate(cost, input_tokens):
     rate = dict(cost)
     applicable = []
-    for tier in cost.get('tiers', []):
+    tiers = cost.get('tiers', [])
+    if not isinstance(tiers, list):
+        return None
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            return None
         rule = tier.get('tier', {})
-        if rule.get('type') != 'context' or not isinstance(rule.get('size'), (int,float)):
+        if not isinstance(rule, dict):
+            return None
+        size = rule.get('size')
+        if rule.get('type') != 'context' or type(size) not in (int,float):
+            return None
+        if not math.isfinite(size) or size < 0:
             return None
         if input_tokens > rule['size']:
             applicable.append((rule['size'],tier))
@@ -169,6 +184,8 @@ def select_rate(cost, input_tokens):
 
 
 def price(record, catalog):
+    if not all(isinstance(record.get(k), str) for k in ('provider','model')):
+        return None
     node = catalog.get(record['provider'], {})
     if not isinstance(node, dict) or not isinstance(node.get('models'), dict):
         return None

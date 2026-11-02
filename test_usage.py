@@ -144,3 +144,30 @@ class CatalogValidationTests(unittest.TestCase):
         module=runpy.run_path(str(SCRIPT))
         record=dict(provider='openai',model='test',usage=usage())
         self.assertIsNone(module['price'](record,{'openai': []}))
+
+class MalformedShapeTests(unittest.TestCase):
+    def setUp(self):
+        self.m=runpy.run_path(str(SCRIPT))
+
+    def test_nonobject_legacy_info(self):
+        warnings=[]
+        rows=[line('event_msg',dict(type='token_count',info=['bad']))]
+        self.assertEqual(list(self.m['candidates'](rows,{},warnings)),[])
+        self.assertTrue(warnings)
+
+    def test_nonstring_timestamp(self):
+        warnings=[]
+        row=modern()
+        row['timestamp']=[]
+        self.assertEqual(list(self.m['candidates']([row],{},warnings)),[])
+        self.assertTrue(warnings)
+
+    def test_invalid_tier_shapes(self):
+        for tiers in (None,{},['bad'],[dict(tier=[])], [dict(tier=dict(type='context',size=float('nan'))) ]):
+            with self.subTest(tiers=tiers):
+                self.assertIsNone(self.m['select_rate'](dict(input=1,tiers=tiers),100))
+
+    def test_invalid_model_provider_identity(self):
+        for provider,model in (([], 'test'),('openai',[])):
+            record=dict(provider=provider,model=model,usage=usage())
+            self.assertIsNone(self.m['price'](record,{'openai':{'models':{}}}))

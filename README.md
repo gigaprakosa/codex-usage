@@ -49,7 +49,7 @@ recovered. Legacy attribution is best effort because snapshots lack response IDs
 
 Tokens equal input plus output. Cached reads and cache writes are subdivisions
 of input; reasoning is a subdivision of output. They are never added again.
-Malformed counters and unreadable records produce an incomplete-report warning,
+Malformed counters, metadata, and unreadable records produce an incomplete-report warning,
 without printing transcript contents. An empty store prints no usage; missing
 session directories exit with an error.
 
