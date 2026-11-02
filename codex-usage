@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Recorded Codex CLI usage and estimated API-equivalent monthly cost."""
+import argparse
+import compression.zstd
+import json
+import math
+import os
+import sys
+import urllib.request
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+CLI_SOURCES = ('cli', 'exec')
+TOKEN_KEYS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
+              'output_tokens', 'reasoning_output_tokens', 'total_tokens')
+
+
+def stamp(value):
+    return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone()
+
+
+def signature(value):
+    return tuple(value.get(k, 0) for k in TOKEN_KEYS)
+
+
+def valid_usage(value):
+    if not isinstance(value, dict):
+        return False
+    values = signature(value)
+    if any(type(n) is not int or n < 0 for n in values):
+        return False
+    inp, cached, writes, out, reasoning, total = values
+    return cached + writes <= inp and reasoning <= out and total == inp + out
+
+
+def discover(home):
+    directories = [home/'sessions', home/'archived_sessions']
+    if not any(d.is_dir() for d in directories):
+        raise FileNotFoundError('Codex session directories missing; run Codex CLI or set CODEX_HOME')
+    paths = []
+    for directory in directories:
+        for path in sorted(directory.rglob('*.jsonl*')):
+            if path.name.endswith('.jsonl'):
+                paths.append(path)
+            elif path.name.endswith('.jsonl.zst') and not path.with_suffix('').exists():
+                paths.append(path)
+    return paths
+
+
+def load_rows(path, warnings):
+    opener = compression.zstd.open if path.suffix == '.zst' else open
+    rows = []
+    try:
+        with opener(path, 'rt', encoding='utf-8') as stream:
+            for raw in stream:
+                try:
+                    row = json.loads(raw)
+                    if not isinstance(row, dict) or not isinstance(row.get('payload'), dict):
+                        raise ValueError('invalid event')
+                    if row.get('type') in ('session_meta','turn_context','token_usage_record','event_msg'):
+                        rows.append(row)
+                except (ValueError, TypeError):
+                    warnings.append('malformed event skipped')
+    except (OSError, UnicodeError, compression.zstd.ZstdError):
+        warnings.append('unreadable session file skipped or partially read')
+    return rows
+
+
+def included(ident, metadata, visiting=None):
+    visiting = set() if visiting is None else visiting
+    if ident in visiting or ident not in metadata:
+        return False
+    visiting.add(ident)
+    meta = metadata[ident]
+    source = meta.get('source')
+    parent = meta.get('parent_thread_id')
+    if not parent and isinstance(source, dict):
+        nested = source.get('subagent')
+        if isinstance(nested, dict) and isinstance(nested.get('thread_spawn'), dict):
+            parent = nested['thread_spawn'].get('parent_thread_id')
+    if parent:
+        return included(parent, metadata, visiting)
+    return isinstance(source, str) and source in CLI_SOURCES
+
+
+def candidates(rows, meta, warnings):
+    model = None
+    previous = None
+    for row in rows:
+        kind, payload = row.get('type'), row['payload']
+        if kind == 'turn_context':
+            model = payload.get('model')
+        modern = kind == 'token_usage_record'
+        legacy = kind == 'event_msg' and payload.get('type') == 'token_count'
+        if not modern and not legacy:
+            continue
+        info = payload.get('info') or {}
+        usage = payload.get('usage') if modern else info.get('last_token_usage')
+        total = payload.get('thread_token_usage') if modern else info.get('total_token_usage')
+        if usage is None:
+            continue
+        if not valid_usage(usage) or not isinstance(total, dict):
+            warnings.append('invalid token counters skipped')
+            continue
+        snapshot = signature(total)
+        if legacy and snapshot == previous:
+            continue
+        if legacy:
+            previous = snapshot
+        try:
+            when = stamp(row['timestamp'])
+            if meta.get('forked_from_id') and when < stamp(meta['timestamp']):
+                continue
+        except (ValueError, KeyError, TypeError):
+            warnings.append('invalid usage timestamp skipped')
+            continue
+        yield dict(timestamp=row['timestamp'], model=model, provider=meta.get('model_provider'),
+                   usage=usage, modern=modern, snapshot=snapshot,
+                   response=payload.get('response_id'))
+
+
+def read_usage(home, warnings):
+    sessions = []
+    metadata = {}
+    for path in discover(home):
+        rows = load_rows(path, warnings)
+        meta = next((r['payload'] for r in rows if r.get('type') == 'session_meta'), {})
+        ident = meta.get('id')
+        if not isinstance(ident, str):
+            warnings.append('session without identity skipped')
+            continue
+        metadata[ident] = meta
+        sessions.append((ident, meta, rows))
+    records = []
+    for ident, meta, rows in sessions:
+        if included(ident, metadata):
+            records.extend((ident, r) for r in candidates(rows, meta, warnings))
+        elif isinstance(meta.get('source'), dict) or meta.get('source') not in ('vscode',):
+            warnings.append('unclassified session or missing ancestry excluded')
+    modern = {(ident,r['snapshot']) for ident,r in records if r['modern']}
+    seen = set()
+    out = []
+    for ident, record in records:
+        if not record['modern'] and (ident,record['snapshot']) in modern:
+            continue
+        key = ('response',record['response']) if record['modern'] else (ident,record['timestamp'],record['snapshot'])
+        if record['modern'] and not record['response']:
+            warnings.append('response without identity skipped')
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(record)
+    return out
+
+
+def select_rate(cost, input_tokens):
+    rate = dict(cost)
+    applicable = []
+    for tier in cost.get('tiers', []):
+        rule = tier.get('tier', {})
+        if rule.get('type') != 'context' or not isinstance(rule.get('size'), (int,float)):
+            return None
+        if input_tokens > rule['size']:
+            applicable.append((rule['size'],tier))
+    if applicable:
+        rate.update(max(applicable, key=lambda item:item[0])[1])
+    return rate
+
+
+def price(record, catalog):
+    node = catalog.get(record['provider'], {})
+    if not isinstance(node, dict) or not isinstance(node.get('models'), dict):
+        return None
+    model = node['models'].get(record['model'], {})
+    if not isinstance(model, dict):
+        return None
+    cost = model.get('cost')
+    if not isinstance(cost, dict):
+        return None
+    u = record['usage']
+    rate = select_rate(cost, u['input_tokens'])
+    if rate is None:
+        return None
+    parts = dict(input=u['input_tokens']-u.get('cached_input_tokens',0)-u.get('cache_write_input_tokens',0),
+                 output=u['output_tokens'], cache_read=u.get('cached_input_tokens',0),
+                 cache_write=u.get('cache_write_input_tokens',0))
+    total = 0
+    for key, count in parts.items():
+        if not count:
+            continue
+        value = rate.get(key)
+        if type(value) not in (int,float) or not math.isfinite(value) or value < 0:
+            return None
+        total += count * value
+    return total / 1_000_000
+
+
+def aggregate(records, catalog, now=None):
+    now = now or datetime.now().astimezone()
+    month_index = now.year*12 + now.month-1
+    buckets = defaultdict(lambda:dict(tokens=0,cost=0.0,unknown=False))
+    for record in records:
+        when = stamp(record['timestamp'])
+        index = when.year*12 + when.month-1
+        if index not in (month_index-1,month_index):
+            continue
+        bucket = buckets[when.strftime('%Y-%m')]
+        u = record['usage']
+        bucket['tokens'] += u['input_tokens'] + u['output_tokens']
+        dollars = price(record,catalog)
+        bucket['unknown'] |= dollars is None
+        bucket['cost'] += dollars or 0
+    return dict(buckets)
+
+
+def load_pricing(cache, warnings):
+    try:
+        request = urllib.request.Request('https://models.dev/api.json',headers={'User-Agent':'codex-usage'})
+        with urllib.request.urlopen(request,timeout=15) as response:
+            raw = response.read()
+        data = json.loads(raw)
+        if not isinstance(data,dict):
+            raise ValueError('invalid catalog')
+    except (OSError, ValueError):
+        warnings.append('pricing is STALE: live fetch failed')
+        try:
+            data = json.loads(cache.read_text())
+            if isinstance(data,dict):
+                return data
+        except (OSError,ValueError):
+            warnings.append('no usable pricing cache; cost is unknown')
+        return {}
+    try:
+        cache.parent.mkdir(parents=True,exist_ok=True)
+        cache.write_bytes(raw)
+        cache.chmod(0o600)
+    except OSError:
+        warnings.append('pricing cache could not be written')
+    return data
+
+
+def render(buckets):
+    lines = ['📊 Codex Usage (last 2 months):']
+    for month,bucket in sorted(buckets.items()):
+        cost = 'unknown' if bucket['unknown'] else f"${bucket['cost']:,.2f}"
+        lines.append(f"• {month}: {bucket['tokens']:,} tokens, Cost: {cost}")
+    if not buckets:
+        lines.append('• no usage in the last 2 months')
+    return '\n'.join(lines)
+
+
+def main():
+    argparse.ArgumentParser(description='Monthly recorded Codex CLI tokens and estimated API-equivalent cost.').parse_args()
+    warnings = []
+    home = Path(os.environ.get('CODEX_HOME',str(Path.home()/'.codex'))).expanduser()
+    try:
+        records = read_usage(home,warnings)
+    except FileNotFoundError as error:
+        print(f'error: {error}',file=sys.stderr)
+        return 1
+    cache = Path.home()/'.cache/codex-usage/models-dev.json'
+    active = aggregate(records,{})
+    catalog = load_pricing(cache,warnings) if active else {}
+    print(render(aggregate(records,catalog)))
+    for warning in sorted(set(warnings)):
+        print(f'warning: {warning}; report may be incomplete',file=sys.stderr)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

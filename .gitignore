@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.zcode/
+.env
+.env.*
+.codex/
+sessions/
+archived_sessions/
+*.jsonl
+*.jsonl.zst
