@@ -33,6 +33,11 @@ class UsageTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(SCRIPT.exists(), 'codex-usage executable is required')
         self.m = runpy.run_path(str(SCRIPT))
+        from unittest.mock import patch
+        clock=type('Clock',(datetime,),{'now':staticmethod(lambda:datetime(2026,11,3,tzinfo=timezone.utc))})
+        frozen=patch.dict(self.m['read_usage'].__globals__,datetime=clock)
+        frozen.start()
+        self.addCleanup(frozen.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
@@ -324,3 +329,19 @@ class ArchiveRetentionTests(unittest.TestCase):
             records=self.m['read_usage'](self.home,[])
         self.assertEqual([r['response'] for r in records],['current'])
         self.assertEqual(records[0]['model'],'test')
+
+
+class FixtureClockTests(unittest.TestCase):
+    def test_reader_fixtures_ignore_the_real_calendar(self):
+        from unittest.mock import patch
+        clock=type('Clock',(datetime,),{'now':staticmethod(lambda:datetime(2027,1,3,tzinfo=timezone.utc))})
+        for case in (UsageTests,ReviewRegressionTests,InterruptedInputTests,ArchiveRetentionTests):
+            with self.subTest(case=case.__name__), patch('datetime.datetime',clock):
+                fixture=case()
+                try:
+                    fixture.setUp()
+                    fixture.write('current.jsonl',session()+[modern()])
+                    records=fixture.m['read_usage'](fixture.home,[])
+                    self.assertEqual([r['response'] for r in records],['r'])
+                finally:
+                    fixture.doCleanups()

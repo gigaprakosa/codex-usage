@@ -95,7 +95,8 @@ python3 -m py_compile codex-usage test_usage.py
 ./codex-usage
 ```
 
-Tests create synthetic sessions in temporary directories. They cover compressed
+Tests create synthetic sessions in temporary directories and freeze the reader clock
+at November 3, 2026 so fixture records stay in the report window. They cover compressed
 and plain logs, duplicate records, CLI ancestry, mixed usage formats, forks,
 month filtering, cache arithmetic, context tiers, unavailable prices, malformed
 logs, offline pricing, and CLI exit behavior. No typechecker is configured;
