@@ -47,7 +47,8 @@ are reused within each report after metadata collection.
 
 Current `token_usage_record.usage` records take precedence over matching legacy
 `token_count` snapshots. Response IDs prevent duplicate current records;
-repeated cumulative legacy snapshots are ignored. Earlier legacy-only activity
+repeated cumulative legacy snapshots are ignored. Rejected timestamps and copied
+pre-fork events do not consume a legacy snapshot; valid historical events do. Earlier legacy-only activity
 is retained in mixed-format sessions. Copied fork history before fork creation
 is excluded. Event timestamps determine the local calendar month, even when a
 session spans months. Missing logs and usage not recorded by Codex cannot be

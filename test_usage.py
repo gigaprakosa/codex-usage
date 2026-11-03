@@ -494,3 +494,27 @@ class MonthlyOverflowTests(unittest.TestCase):
                 catalog={'openai':{'models':{'test':{'cost':dict(input=rate)}}}}
                 result=module['aggregate']([record],catalog,datetime(2026,11,3,tzinfo=timezone.utc))
                 self.assertIn(want,module['render'](result))
+
+class LegacyTimestampTests(unittest.TestCase):
+    setUp = UsageTests.setUp
+    write = UsageTests.write
+
+    def test_rejected_legacy_timestamp_does_not_consume_snapshot(self):
+        payload=dict(type='token_count',info=dict(last_token_usage=usage(),total_token_usage=usage()))
+        cases=[('bad',False,1), ('2026-09-01T00:00:00Z',True,1),
+               ('2026-09-01T00:00:00Z',False,0)]
+        for first,forked,want in cases:
+            with self.subTest(first=first,forked=forked):
+                rows=session()
+                if forked:
+                    rows[0]['payload']['forked_from_id']='parent'
+                self.write('legacy.jsonl',rows+[line('event_msg',payload,first),
+                                               line('event_msg',payload)])
+                warnings=[]
+                records=self.m['read_usage'](self.home,warnings)
+                self.assertEqual(len(records),want)
+                if want:
+                    result=self.m['aggregate'](records,{},datetime(2026,11,3,tzinfo=timezone.utc))
+                    self.assertEqual(result['2026-11']['tokens'],130)
+                if first == 'bad':
+                    self.assertIn('invalid usage timestamp skipped',warnings)

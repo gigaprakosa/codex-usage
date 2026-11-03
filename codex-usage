@@ -138,8 +138,6 @@ def candidates(rows, meta, warnings, month_index=None):
         snapshot = signature(total)
         if legacy and snapshot == previous:
             continue
-        if legacy:
-            previous = snapshot
         try:
             when = stamp(row['timestamp'])
             if meta.get('forked_from_id') and when < stamp(meta['timestamp']):
@@ -147,6 +145,8 @@ def candidates(rows, meta, warnings, month_index=None):
         except (ValueError, KeyError, TypeError, OverflowError):
             warnings.append('invalid usage timestamp skipped')
             continue
+        if legacy:
+            previous = snapshot
         if month_index is not None and when.year*12 + when.month-1 not in (month_index-1,month_index):
             continue
         if modern and (not isinstance(payload.get('response_id'), str) or not payload['response_id']):
