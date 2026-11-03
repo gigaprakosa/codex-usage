@@ -34,6 +34,7 @@ The reader scans `sessions` and `archived_sessions` under `$CODEX_HOME`, or
 `~/.codex` when unset. Both `.jsonl` and `.jsonl.zst` are supported. A plain file
 wins over its compressed sibling. Session files are opened for reading only;
 the tool does not read credentials or send session data to a service.
+Unrelated message events and unused payload fields are discarded during loading.
 
 CLI sources `cli` and `exec` are included, together with descendants whose
 parent chain reaches a CLI root. Editor sessions are excluded. Missing ancestry
@@ -49,6 +50,9 @@ recovered. Legacy attribution is best effort because snapshots lack response IDs
 
 Tokens equal input plus output. Cached reads and cache writes are subdivisions
 of input; reasoning is a subdivision of output. They are never added again.
+Input and output counters must be present, cumulative counters must be valid,
+and response identities must be nonempty strings. Rejected current records do
+not suppress valid legacy snapshots. Malformed ancestry is excluded.
 Malformed counters, metadata, and unreadable records produce an incomplete-report warning,
 without printing transcript contents. An empty store prints no usage; missing
 session directories exit with an error.
@@ -75,7 +79,9 @@ not historical invoices, subscription charges, or quota consumption.
 A successful fetch updates `~/.cache/codex-usage/models-dev.json`. If the network
 fails, a usable cache supplies stale prices with a warning on stderr. Without
 usable prices, cost is unknown. Cache-write failures warn without discarding
-live pricing. The pricing cache is the only data file this tool writes.
+live pricing. Cache updates use a private temporary sibling and atomic replacement
+so a failed write preserves the previous offline catalog. The pricing cache and
+its temporary sibling are the only data files this tool writes.
 
 ## Verification
 

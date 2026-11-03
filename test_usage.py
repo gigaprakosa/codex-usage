@@ -171,3 +171,98 @@ class MalformedShapeTests(unittest.TestCase):
         for provider,model in (([], 'test'),('openai',[])):
             record=dict(provider=provider,model=model,usage=usage())
             self.assertIsNone(self.m['price'](record,{'openai':{'models':{}}}))
+
+class ReviewRegressionTests(unittest.TestCase):
+    setUp=UsageTests.setUp
+    write=UsageTests.write
+    read=UsageTests.read
+
+    def test_missing_required_counters_are_skipped(self):
+        for key in ('input_tokens','output_tokens'):
+            with self.subTest(key=key):
+                bad=modern('bad')
+                bad['payload']['usage']={'input_tokens':100,'output_tokens':30,'total_tokens':130}
+                del bad['payload']['usage'][key]
+                bad['payload']['usage']['total_tokens']=sum(
+                    bad['payload']['usage'].get(k,0) for k in ('input_tokens','output_tokens'))
+                self.write('a.jsonl',session()+[modern(),bad])
+                warnings=[]
+                records=self.m['read_usage'](self.home,warnings)
+                self.assertEqual(len(records),1)
+                self.assertTrue(warnings)
+                self.assertEqual(self.m['aggregate'](records,{},datetime(2026,11,3,tzinfo=timezone.utc))['2026-11']['tokens'],130)
+
+    def test_malformed_counter_and_identity_shapes_are_skipped(self):
+        cases=[('total',{'input_tokens':[]}),('response',['bad']),('response',{'bad':1}),
+               ('response',42),('parent',[]),('parent',{}),('parent',42),
+               ('nested_parent',['bad'])]
+        for field,value in cases:
+            with self.subTest(field=field,value=value):
+                rows=session(ident='bad')+[modern('bad')]
+                if field=='total':
+                    rows[-1]['payload']['thread_token_usage']=value
+                elif field=='response':
+                    rows[-1]['payload']['response_id']=value
+                elif field=='parent':
+                    rows[0]['payload']['parent_thread_id']=value
+                else:
+                    rows[0]['payload']['source']={'subagent':{'thread_spawn':{'parent_thread_id':value}}}
+                self.write('bad.jsonl',rows)
+                self.write('good.jsonl',session()+[modern()])
+                warnings=[]
+                self.assertEqual(len(self.m['read_usage'](self.home,warnings)),1)
+                self.assertTrue(warnings)
+
+    def test_rejected_modern_record_keeps_legacy_fallback(self):
+        old=line('event_msg',dict(type='token_count',info=dict(last_token_usage=usage(),total_token_usage=usage())))
+        for response in (None,'',[],['bad'],42):
+            with self.subTest(response=response):
+                self.write('a.jsonl',session()+[modern(response),old])
+                warnings=[]
+                records=self.m['read_usage'](self.home,warnings)
+                self.assertEqual(len(records),1)
+                self.assertFalse(records[0]['modern'])
+                self.assertEqual(self.m['aggregate'](records,{},datetime(2026,11,3,tzinfo=timezone.utc))['2026-11']['tokens'],130)
+                self.assertTrue(warnings)
+
+    def test_loader_discards_transcript_bodies(self):
+        rows=session()+[modern(),line('event_msg',dict(type='token_count',info=dict(last_token_usage=usage(),total_token_usage=usage())))]
+        for row in rows:
+            row['payload']['unrelated']='x'*10000
+        path=self.write('a.jsonl',rows+[line('event_msg',dict(type='agent_message',message='x'*10000))])
+        retained=self.m['load_rows'](path,[])
+        self.assertEqual(len(retained),4)
+        self.assertNotIn('unrelated',json.dumps(retained))
+        self.assertLess(len(json.dumps(retained)),2000)
+        self.assertEqual(len(self.read()),1)
+
+    def test_cache_failure_preserves_offline_catalog(self):
+        from unittest.mock import patch
+        import io
+        cache=self.home/'prices.json'
+        old=b'{"old": {"models": {}}}'
+        live=b'{"live": {"models": {}}}'
+        cache.write_bytes(old)
+        def fail_write(path, raw):
+            with path.open('wb') as stream:
+                stream.write(raw[:5])
+            raise OSError('disk full')
+        with patch('urllib.request.urlopen',return_value=io.BytesIO(live)), patch('pathlib.Path.write_bytes',autospec=True,side_effect=fail_write):
+            warnings=[]
+            self.assertIn('live',self.m['load_pricing'](cache,warnings))
+        self.assertTrue(warnings)
+        self.assertEqual(cache.read_bytes(),old)
+        with patch('urllib.request.urlopen',side_effect=OSError('offline')):
+            self.assertIn('old',self.m['load_pricing'](cache,[]))
+
+    def test_cache_replacement_publishes_complete_private_catalog(self):
+        from unittest.mock import patch
+        import io
+        cache=self.home/'prices.json'
+        cache.write_text('{}')
+        live=b'{"live": {"models": {}}}'
+        with patch('urllib.request.urlopen',return_value=io.BytesIO(live)):
+            self.assertIn('live',self.m['load_pricing'](cache,[]))
+        self.assertEqual(cache.read_bytes(),live)
+        self.assertEqual(cache.stat().st_mode & 0o777,0o600)
+        self.assertEqual(sorted(p.name for p in self.home.iterdir()),['prices.json','sessions'])

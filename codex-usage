@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import urllib.request
 from collections import defaultdict
 from datetime import datetime
@@ -14,6 +15,12 @@ from pathlib import Path
 CLI_SOURCES = ('cli', 'exec')
 TOKEN_KEYS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
               'output_tokens', 'reasoning_output_tokens', 'total_tokens')
+ROW_FIELDS = {
+    'session_meta': ('id','source','parent_thread_id','model_provider','timestamp','forked_from_id'),
+    'turn_context': ('model',),
+    'token_usage_record': ('usage','thread_token_usage','response_id'),
+    'event_msg': ('type','info'),
+}
 
 
 def stamp(value):
@@ -27,7 +34,7 @@ def signature(value):
 
 
 def valid_usage(value):
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or not all(k in value for k in ('input_tokens','output_tokens')):
         return False
     values = signature(value)
     if any(type(n) is not int or n < 0 for n in values):
@@ -60,8 +67,15 @@ def load_rows(path, warnings):
                     row = json.loads(raw)
                     if not isinstance(row, dict) or not isinstance(row.get('payload'), dict):
                         raise ValueError('invalid event')
-                    if row.get('type') in ('session_meta','turn_context','token_usage_record','event_msg'):
-                        rows.append(row)
+                    kind, payload = row.get('type'), row['payload']
+                    if kind == 'event_msg' and payload.get('type') != 'token_count':
+                        continue
+                    if kind in ROW_FIELDS:
+                        payload = {k:payload[k] for k in ROW_FIELDS[kind] if k in payload}
+                        if kind == 'event_msg' and isinstance(payload.get('info'), dict):
+                            payload['info'] = {k:v for k,v in payload['info'].items()
+                                               if k in ('last_token_usage','total_token_usage')}
+                        rows.append(dict(type=kind, timestamp=row.get('timestamp'), payload=payload))
                 except (ValueError, TypeError):
                     warnings.append('malformed event skipped')
     except (OSError, UnicodeError, compression.zstd.ZstdError):
@@ -71,17 +85,17 @@ def load_rows(path, warnings):
 
 def included(ident, metadata, visiting=None):
     visiting = set() if visiting is None else visiting
-    if ident in visiting or ident not in metadata:
+    if not isinstance(ident, str) or not ident or ident in visiting or ident not in metadata:
         return False
     visiting.add(ident)
     meta = metadata[ident]
     source = meta.get('source')
     parent = meta.get('parent_thread_id')
-    if not parent and isinstance(source, dict):
+    if parent is None and isinstance(source, dict):
         nested = source.get('subagent')
         if isinstance(nested, dict) and isinstance(nested.get('thread_spawn'), dict):
             parent = nested['thread_spawn'].get('parent_thread_id')
-    if parent:
+    if parent is not None:
         return included(parent, metadata, visiting)
     return isinstance(source, str) and source in CLI_SOURCES
 
@@ -105,7 +119,7 @@ def candidates(rows, meta, warnings):
         total = payload.get('thread_token_usage') if modern else info.get('total_token_usage')
         if usage is None:
             continue
-        if not valid_usage(usage) or not isinstance(total, dict):
+        if not valid_usage(usage) or not valid_usage(total):
             warnings.append('invalid token counters skipped')
             continue
         snapshot = signature(total)
@@ -120,6 +134,9 @@ def candidates(rows, meta, warnings):
         except (ValueError, KeyError, TypeError):
             warnings.append('invalid usage timestamp skipped')
             continue
+        if modern and (not isinstance(payload.get('response_id'), str) or not payload['response_id']):
+            warnings.append('response without identity skipped')
+            continue
         yield dict(timestamp=row['timestamp'], model=model, provider=meta.get('model_provider'),
                    usage=usage, modern=modern, snapshot=snapshot,
                    response=payload.get('response_id'))
@@ -132,7 +149,7 @@ def read_usage(home, warnings):
         rows = load_rows(path, warnings)
         meta = next((r['payload'] for r in rows if r.get('type') == 'session_meta'), {})
         ident = meta.get('id')
-        if not isinstance(ident, str):
+        if not isinstance(ident, str) or not ident:
             warnings.append('session without identity skipped')
             continue
         metadata[ident] = meta
@@ -150,9 +167,6 @@ def read_usage(home, warnings):
         if not record['modern'] and (ident,record['snapshot']) in modern:
             continue
         key = ('response',record['response']) if record['modern'] else (ident,record['timestamp'],record['snapshot'])
-        if record['modern'] and not record['response']:
-            warnings.append('response without identity skipped')
-            continue
         if key not in seen:
             seen.add(key)
             out.append(record)
@@ -231,6 +245,17 @@ def aggregate(records, catalog, now=None):
     return dict(buckets)
 
 
+def write_pricing(cache, raw):
+    cache.parent.mkdir(parents=True,exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=cache.parent,delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        temporary.write_bytes(raw)
+        os.replace(temporary,cache)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def load_pricing(cache, warnings):
     try:
         request = urllib.request.Request('https://models.dev/api.json',headers={'User-Agent':'codex-usage'})
@@ -249,9 +274,7 @@ def load_pricing(cache, warnings):
             warnings.append('no usable pricing cache; cost is unknown')
         return {}
     try:
-        cache.parent.mkdir(parents=True,exist_ok=True)
-        cache.write_bytes(raw)
-        cache.chmod(0o600)
+        write_pricing(cache,raw)
     except OSError:
         warnings.append('pricing cache could not be written')
     return data
