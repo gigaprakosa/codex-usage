@@ -6,6 +6,11 @@ import json
 import http.client
 import math
 import os
+import socket
+import shutil
+import ssl
+import sqlite3
+import urllib.error
 import sys
 import tempfile
 import urllib.request
@@ -68,6 +73,7 @@ def iter_rows(path, warnings):
     try:
         with opener(path, 'rt', encoding='utf-8') as stream:
             for raw in stream:
+                row = None
                 try:
                     row = json.loads(raw)
                     if not isinstance(row, dict) or not isinstance(row.get('payload'), dict):
@@ -82,9 +88,20 @@ def iter_rows(path, warnings):
                                                if k in ('last_token_usage','total_token_usage')}
                         yield dict(type=kind, timestamp=row.get('timestamp'), payload=payload)
                 except (ValueError, TypeError):
-                    warnings.append('malformed event skipped')
+                    if diagnostic_relevant(row):
+                        warnings.append('malformed event skipped')
     except (OSError, EOFError, UnicodeError, compression.zstd.ZstdError):
         warnings.append('unreadable session file skipped or partially read')
+
+
+def parent_thread(meta):
+    parent = meta.get('parent_thread_id')
+    source = meta.get('source')
+    if parent is None and isinstance(source,dict):
+        nested = source.get('subagent')
+        if isinstance(nested,dict) and isinstance(nested.get('thread_spawn'),dict):
+            parent = nested['thread_spawn'].get('parent_thread_id')
+    return parent
 
 
 def included(ident, metadata, visiting=None, resolved=None):
@@ -100,11 +117,7 @@ def included(ident, metadata, visiting=None, resolved=None):
         visiting.add(ident)
         meta = metadata[ident]
         source = meta.get('source')
-        parent = meta.get('parent_thread_id')
-        if parent is None and isinstance(source, dict):
-            nested = source.get('subagent')
-            if isinstance(nested, dict) and isinstance(nested.get('thread_spawn'), dict):
-                parent = nested['thread_spawn'].get('parent_thread_id')
+        parent = parent_thread(meta)
         if parent is None:
             result = isinstance(source, str) and source in CLI_SOURCES
             break
@@ -113,75 +126,411 @@ def included(ident, metadata, visiting=None, resolved=None):
     return result
 
 
-def candidates(rows, meta, warnings, month_index=None):
+def relevant(timestamp, month_index):
+    when = stamp(timestamp)
+    return month_index is None or when.year*12 + when.month-1 in (month_index-1,month_index)
+
+
+def usage_time(row, meta, warnings, month_index):
+    active = None
+    try:
+        active = relevant(row.get('timestamp'), month_index)
+        when = stamp(row.get('timestamp'))
+        if meta.get('forked_from_id') and when < stamp(meta['timestamp']):
+            return None
+        return active
+    except (ValueError, KeyError, TypeError, OverflowError):
+        if active is not False:
+            warnings.append('invalid usage timestamp skipped')
+        return None
+
+
+def candidate(row, meta, model, modern, usage, total):
+    return dict(timestamp=row['timestamp'], model=model, provider=meta.get('model_provider'),
+                usage=usage, modern=modern, snapshot=signature(total) if valid_usage(total) else None,
+                response=row['payload'].get('response_id'), status='exact', total_evidence=total)
+
+
+def token_parts(row, modern):
+    payload = row['payload']
+    info = payload.get('info') or {}
+    if not isinstance(info, dict):
+        return None, None, 'invalid token metadata skipped'
+    usage = payload.get('usage') if modern else info.get('last_token_usage')
+    total = payload.get('thread_token_usage') if modern else info.get('total_token_usage')
+    error = None if valid_usage(usage) and valid_usage(total) else 'invalid token counters skipped'
+    if modern and (not isinstance(payload.get('response_id'), str) or not payload['response_id']):
+        error = 'response without identity skipped'
+    return usage, total, error
+
+
+def diagnostic_relevant(row):
+    if isinstance(row,dict) and isinstance(row.get('timestamp'),str):
+        now = datetime.now().astimezone()
+        try:
+            return relevant(row['timestamp'],now.year*12+now.month-1)
+        except (ValueError,OverflowError):
+            pass  # Invalid timestamps cannot establish historical irrelevance.
+    return True
+
+
+def candidate_rows(rows, meta, warnings, month_index):
     model = None
-    previous = None
     for row in rows:
-        kind, payload = row.get('type'), row['payload']
+        kind, payload = row.get('type'),row['payload']
         if kind == 'turn_context':
             model = payload.get('model')
         modern = kind == 'token_usage_record'
-        legacy = kind == 'event_msg' and payload.get('type') == 'token_count'
-        if not modern and not legacy:
+        if not modern and not (kind == 'event_msg' and payload.get('type') == 'token_count'):
             continue
-        info = payload.get('info') or {}
-        if not isinstance(info, dict):
-            warnings.append('invalid token metadata skipped')
+        local = []
+        active = usage_time(row,meta,local,month_index)
+        warnings.extend(local)
+        usage,total,error = token_parts(row,modern)
+        if not modern and usage is None and total is None and error != 'invalid token metadata skipped':
             continue
-        usage = payload.get('usage') if modern else info.get('last_token_usage')
-        total = payload.get('thread_token_usage') if modern else info.get('total_token_usage')
-        if usage is None:
+        record = candidate(row,meta,model,modern,usage,total)
+        record['error'] = error
+        yield record,active
+
+
+def candidates(rows, meta, warnings, month_index=None, recovery=False):
+    previous, checkpoint, pending, isolated = None, None, None, True
+    for record,active in candidate_rows(rows,meta,warnings,month_index):
+        modern,error = record['modern'],record['error']
+        if pending is not None:
+            pending['right'] = record if modern and active is not None else None
+            pending['isolated'] &= modern and not error and active is not None
+            yield pending
+            pending = None
+        if not active:
+            if active is False and not error:
+                previous = (record['snapshot'],signature(record['usage'])) if not modern else previous
+            checkpoint = record if active is False and modern and not error else None
+            isolated = bool(checkpoint)
             continue
-        if not valid_usage(usage) or not valid_usage(total):
-            warnings.append('invalid token counters skipped')
+        if not modern and not error and (record['snapshot'],signature(record['usage'])) == previous:
             continue
-        snapshot = signature(total)
-        if legacy and snapshot == previous:
-            continue
+        if not modern and not error:
+            previous = (record['snapshot'],signature(record['usage']))
+        if error and recovery and modern:
+            record.update(left=checkpoint,isolated=isolated)
+            pending = record
+        elif error:
+            warnings.append(error)
+        else:
+            yield record
+        checkpoint = record if modern and not error else None
+        isolated = bool(checkpoint)
+    if pending is not None:
+        pending['right'] = None
+        yield pending
+
+
+def state_metadata(home, metadata, warnings):
+    for path in sorted(home.glob('state*.sqlite')):
         try:
-            when = stamp(row['timestamp'])
-            if meta.get('forked_from_id') and when < stamp(meta['timestamp']):
+            with tempfile.TemporaryDirectory(prefix='codex-usage-state-') as directory:
+                copy = Path(directory)/path.name
+                shutil.copyfile(path,copy)
+                wal = Path(str(path)+'-wal')
+                if wal.exists():
+                    shutil.copyfile(wal,Path(str(copy)+'-wal'))
+                with closing(sqlite3.connect(copy.as_uri()+'?mode=ro', uri=True)) as db:
+                    tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if 'threads' in tables:
+                        state_threads(db, metadata)
+                    if 'thread_spawn_edges' in tables:
+                        state_edges(db, metadata)
+        except (sqlite3.Error, OSError):
+            warnings.append('ancestry state unavailable; session metadata used')
+
+
+def state_threads(db, metadata):
+    columns = {r[1] for r in db.execute('PRAGMA table_info(threads)')}
+    fields = [k for k in ('id','source','model_provider','parent_thread_id') if k in columns]
+    if 'id' not in fields:
+        return
+    for values in db.execute('SELECT '+','.join(fields)+' FROM threads'):
+        meta = dict(zip(fields,values))
+        ident = meta.get('id')
+        if not isinstance(ident,str) or not ident:
+            continue
+        source = meta.get('source')
+        if isinstance(source,str):
+            try:
+                decoded = json.loads(source)
+                if isinstance(decoded,(str,dict)):
+                    meta['source'] = decoded
+            except ValueError:
+                pass  # Plain source names are also stored by Codex.
+        target = metadata.setdefault(ident,{})
+        for key,value in meta.items():
+            if key == 'parent_thread_id' and parent_thread(target) is not None:
                 continue
-        except (ValueError, KeyError, TypeError, OverflowError):
-            warnings.append('invalid usage timestamp skipped')
-            continue
-        if legacy:
-            previous = snapshot
-        if month_index is not None and when.year*12 + when.month-1 not in (month_index-1,month_index):
-            continue
-        if modern and (not isinstance(payload.get('response_id'), str) or not payload['response_id']):
-            warnings.append('response without identity skipped')
-            continue
-        yield dict(timestamp=row['timestamp'], model=model, provider=meta.get('model_provider'),
-                   usage=usage, modern=modern, snapshot=snapshot,
-                   response=payload.get('response_id'))
+            if target.get(key) is None:
+                target[key] = value
 
 
-def read_usage(home, warnings):
-    now = datetime.now().astimezone()
-    month_index = now.year*12 + now.month-1
-    sessions = []
-    metadata = {}
-    for path in discover(home):
-        with closing(iter_rows(path, warnings)) as rows:
+def state_edges(db, metadata):
+    columns = {r[1] for r in db.execute('PRAGMA table_info(thread_spawn_edges)')}
+    if not {'parent_thread_id','child_thread_id'} <= columns:
+        return
+    for parent,child in db.execute('SELECT parent_thread_id,child_thread_id FROM thread_spawn_edges'):
+        if isinstance(parent,str) and parent and isinstance(child,str) and child:
+            meta = metadata.setdefault(child,{})
+            if parent_thread(meta) is None:
+                meta['parent_thread_id'] = parent
+
+
+def session_inventory(home, warnings):
+    sessions, metadata = [], {}
+    paths = discover(home)
+    for path in paths:
+        sibling = Path(str(path)+'.zst')
+        if path.suffix != '.zst' and sibling.exists():
+            paths.append(sibling)
+        local = []
+        with closing(iter_rows(path, local)) as rows:
             meta = next((r['payload'] for r in rows if r.get('type') == 'session_meta'), {})
         ident = meta.get('id')
-        if not isinstance(ident, str) or not ident:
-            warnings.append('session without identity skipped')
+        if not isinstance(ident,str) or not ident:
+            found = list(candidates(iter_rows(path,local),meta,local,
+                                    datetime.now().year*12+datetime.now().month-1,True))
+            if found or local:
+                warnings.extend(local)
+                warnings.append('session without identity skipped')
             continue
-        metadata[ident] = meta
-        sessions.append((ident, meta, path))
-    records = []
-    resolved = {}
-    for ident, meta, path in sessions:
-        if included(ident, metadata, resolved=resolved):
-            records.extend((ident, r) for r in candidates(iter_rows(path, warnings), meta, warnings, month_index))
-        elif isinstance(meta.get('source'), dict) or meta.get('source') not in ('vscode',):
+        metadata.setdefault(ident,meta)
+        sessions.append((ident,path))
+    state_metadata(home,metadata,warnings)
+    return sessions,metadata
+
+
+def collect_records(sessions, metadata, month_index, warnings):
+    records, resolved, editors = [], {}, None
+    for ident,path in sessions:
+        meta, local = metadata[ident], []
+        accepted = included(ident,metadata,resolved=resolved)
+        if not accepted:
+            if editors is None:
+                editors = {k:dict(v,parent_thread_id=parent_thread(v),
+                                  source='cli' if v.get('source') == 'vscode' else 'unknown')
+                           for k,v in metadata.items()}
+            if included(ident,editors):
+                continue
+        rows = candidates(iter_rows(path,local),meta,local,month_index,True)
+        found = list(rows)
+        if accepted:
+            if local:
+                for record in found:
+                    record['blocked'] = True
+            warnings.extend(local)
+            records.extend((ident,r) for r in found)
+        elif found or local:
             warnings.append('unclassified session or missing ancestry excluded')
-    modern = {(ident,r['snapshot']) for ident,r in records if r['modern']}
-    seen = set()
-    out = []
-    for ident, record in records:
+    return records
+
+
+def identity(ident, record):
+    return (ident, *(record[k] if isinstance(record.get(k),str) else None
+                     for k in ('provider','model','response')))
+
+
+def identifiable(record):
+    return all(isinstance(record.get(k),str) and record[k]
+               for k in ('provider','model','response'))
+
+
+def supplied_counts_match(value, recovered):
+    if not isinstance(value,dict):
+        return value is None
+    return all(type(v) is int and v >= 0 and recovered.get(k) == v
+               for k,v in value.items() if k in TOKEN_KEYS)
+
+
+def cumulative_recovery(record):
+    left, right = record.get('left'),record.get('right')
+    if left and right is None and record['snapshot'] is not None and identifiable(record):
+        if record.get('blocked') or not record.get('isolated') or stamp(left['timestamp']) > stamp(record['timestamp']):
+            return None, 'contradictory'
+        if left['model'] != record['model'] or left['provider'] != record['provider']:
+            return None, 'contradictory'
+        delta = dict(zip(TOKEN_KEYS,(b-a for a,b in zip(left['snapshot'],record['snapshot']))))
+        if valid_usage(delta) and delta['total_tokens'] > 0 and supplied_counts_match(record['usage'],delta):
+            return delta, 'recovered'
+        return None, 'contradictory'
+    if record.get('blocked') or not left or not right or right['error'] or not identifiable(record):
+        return None, 'unavailable'
+    if any(r['model'] != record['model'] or r['provider'] != record['provider']
+           for r in (left,right)):
+        return None, 'contradictory'
+    if len({r['response'] for r in (left,record,right)}) != 3:
+        return None, 'contradictory'
+    if not stamp(left['timestamp']) <= stamp(record['timestamp']) <= stamp(right['timestamp']):
+        return None, 'contradictory'
+    delta = {k:b-a-c for k,a,b,c in zip(TOKEN_KEYS,left['snapshot'],right['snapshot'],signature(right['usage']))}
+    if not valid_usage(delta):
+        return None, 'contradictory'
+    if record['snapshot'] is not None:
+        expected = tuple(a+b for a,b in zip(left['snapshot'],signature(delta)))
+        if expected != record['snapshot']:
+            return None, 'contradictory'
+    if not supplied_counts_match(record['usage'],delta):
+        return None, 'contradictory'
+    return delta, 'recovered'
+
+
+def disjoint(usage):
+    inp, cached, writes, out, reasoning, total = signature(usage)
+    return inp-cached-writes,cached,writes,out-reasoning,reasoning
+
+
+def rounded_median(values):
+    ordered = sorted(values)
+    middle = len(ordered)//2
+    pair = ordered[middle] + ordered[(len(ordered)-1)//2]
+    whole, half = divmod(pair,2)
+    return whole + (half and whole%2)
+
+
+def median_usage(samples):
+    parts = [rounded_median(values) for values in zip(*(disjoint(r['usage']) for r in samples))]
+    uncached,cached,writes,ordinary,reasoning = parts
+    inp, out = uncached+cached+writes,ordinary+reasoning
+    return dict(zip(TOKEN_KEYS,(inp,cached,writes,out,reasoning,inp+out)))
+
+
+def estimate(record, samples):
+    if record.get('usage') or not identifiable(record) or len(samples) < 5:
+        return None
+    if record.get('blocked') or not record.get('isolated'):
+        return None
+    left = record.get('left')
+    if record.get('total_evidence') is not None and (record['snapshot'] is None or left):
+        return None
+    if left and record['snapshot'] is not None and (record['snapshot'][-1] <= left['snapshot'][-1]
+            or any(b < a for a,b in zip(left['snapshot'],record['snapshot']))):
+        return None
+    result = median_usage(samples)
+    if record['snapshot'] is not None and signature(result) != record['snapshot']:
+        return None
+    return result
+
+
+def recovery_evidence(records):
+    exact, samples, occurrences = {}, defaultdict(dict), defaultdict(int)
+    for ident,record in records:
+        if record['modern'] and identifiable(record):
+            occurrences[identity(ident,record)] += 1
+        if not record['modern'] or record['error'] or not identifiable(record):
+            continue
+        key = identity(ident,record)
+        exact.setdefault(key,[]).append(record)
+    for key,alternates in exact.items():
+        if len({signature(r['usage']) for r in alternates}) == 1:
+            samples[key[:3]][key] = alternates[0]
+    return exact,samples,occurrences
+
+
+def legacy_recovery(ident, record, records):
+    if not identifiable(record):
+        return None, 'unavailable'
+    twins = [r for session,r in records if session == ident and not r['modern']
+             and not r['error'] and record['snapshot'] is not None
+             and r['snapshot'] == record['snapshot']
+             and r['model'] == record['model'] and r['provider'] == record['provider']]
+    if not twins:
+        return None, 'unavailable'
+    owners = {identity(session,r)[-1] for session,r in records if session == ident and r['modern']
+              and r['snapshot'] == record['snapshot'] and r['snapshot'] is not None}
+    if len(owners) != 1:
+        return None, 'contradictory'
+    signatures = {signature(r['usage']) for r in twins}
+    if len(signatures) != 1 or not supplied_counts_match(record['usage'],twins[0]['usage']):
+        return None, 'contradictory'
+    return twins[0]['usage'], 'recovered'
+
+
+def conflicting_record(ident, record, legacy, exact, warnings):
+    if not record['modern'] and len(legacy.get((identity(ident,record)[:3],record['snapshot']),set())) > 1:
+        warnings.append('conflicting legacy snapshots excluded; coverage unresolved')
+        return True
+    copies = exact.get(identity(ident,record),[])
+    if len({signature(r['usage']) for r in copies}) > 1:
+        warnings.append('conflicting recorded responses excluded; coverage unresolved')
+        return True
+    return False
+
+
+def reconciled_evidence(records):
+    exact,samples,occurrences = recovery_evidence(records)
+    conflicts = {identity(i,r) for i,r in records if r['error']
+                 and exact.get(identity(i,r)) and any(not supplied_counts_match(r['usage'],v['usage'])
+                 for v in exact[identity(i,r)])}
+    for group in samples.values():
+        for key in conflicts:
+            group.pop(key,None)
+    legacy = defaultdict(set)
+    for ident,r in records:
+        if not r['modern'] and not r['error']:
+            legacy[(identity(ident,r)[:3],r['snapshot'])].add(signature(r['usage']))
+    return exact,samples,occurrences,conflicts,legacy
+
+
+def choose_recovery(ident, record, records, exact, samples, occurrences):
+    key = identity(ident,record) if identifiable(record) else None
+    unique = key and occurrences[key] == 1
+    neighbors = [record.get(k) for k in ('left','right')]
+    known = all(r is None or occurrences[identity(ident,r)] <= 1 for r in neighbors)
+    usage,evidence = legacy_recovery(ident,record,records)
+    if evidence == 'unavailable' and unique and known and key not in exact:
+        usage,evidence = cumulative_recovery(record)
+    status = 'recovered'
+    if evidence == 'unavailable' and (not unique or any(r and occurrences[identity(ident,r)] > 1 for r in neighbors)):
+        evidence = 'contradictory'
+    if evidence == 'unavailable' and unique and key not in exact:
+        usage = estimate(record,list(samples.get((ident,record['provider'],record['model']),{}).values()))
+        status = 'estimated'
+    return usage,evidence,status
+
+
+def recover_records(records, warnings):
+    exact,samples,occurrences,conflicts,legacy = reconciled_evidence(records)
+    out, gaps, recovered = [], {}, set()
+    for ident,record in records:
+        key = identity(ident,record)
+        if key in conflicts:
+            warnings.append('conflicting alternate counters excluded; coverage unresolved')
+            continue
+        if conflicting_record(ident,record,legacy,exact,warnings):
+            continue
+        if not record['error']:
+            out.append((ident,record))
+            continue
+        key = identity(ident,record) if identifiable(record) else None
+        alternates = exact.get(key,[])
+        if alternates and len({signature(r['usage']) for r in alternates}) == 1:
+            recovered.add(key)
+            continue
+        usage,evidence,status = choose_recovery(ident,record,records,exact,samples,occurrences)
+        if usage is not None:
+            if status == 'recovered' and record['snapshot'] is None:
+                record['snapshot'] = tuple(a+b for a,b in zip(record['left']['snapshot'],signature(usage)))
+            out.append((ident,dict(record,usage=usage,status=status,error=None)))
+        else:
+            warnings.append('contradictory recovery evidence skipped' if evidence == 'contradictory' else record['error'])
+            month = stamp(record['timestamp']).strftime('%Y-%m')
+            gaps.setdefault(month,set()).add(key or (ident,record['timestamp'],record['error']))
+    for month,missing in sorted(gaps.items()):
+        warnings.append(f'{month}: {len(missing)} unresolved usage gaps')
+    return [(ident,dict(r,status='recovered') if identity(ident,r) in recovered else r) for ident,r in out]
+
+
+def deduplicate(records):
+    modern = {(ident,r['snapshot']) for ident,r in records if r['modern'] and r['snapshot'] is not None}
+    seen, out = set(), []
+    for ident,record in records:
         if not record['modern'] and (ident,record['snapshot']) in modern:
             continue
         key = ('response',record['response']) if record['modern'] else (ident,record['timestamp'],record['snapshot'])
@@ -189,6 +538,14 @@ def read_usage(home, warnings):
             seen.add(key)
             out.append(record)
     return out
+
+
+def read_usage(home, warnings):
+    now = datetime.now().astimezone()
+    month_index = now.year*12 + now.month-1
+    sessions,metadata = session_inventory(home,warnings)
+    records = collect_records(sessions,metadata,month_index,warnings)
+    return deduplicate(recover_records(records,warnings))
 
 
 def valid_price_number(value):
@@ -262,7 +619,7 @@ def price(record, catalog):
 def aggregate(records, catalog, now=None):
     now = now or datetime.now().astimezone()
     month_index = now.year*12 + now.month-1
-    buckets = defaultdict(lambda:dict(tokens=0,cost=0.0,unknown=False))
+    buckets = defaultdict(lambda:dict(tokens=0,cost=0.0,unknown=False,exact=0,recovered=0,estimated=0,estimated_tokens=0))
     for record in records:
         when = stamp(record['timestamp'])
         index = when.year*12 + when.month-1
@@ -271,6 +628,9 @@ def aggregate(records, catalog, now=None):
         bucket = buckets[when.strftime('%Y-%m')]
         u = record['usage']
         bucket['tokens'] += u['input_tokens'] + u['output_tokens']
+        bucket[record.get('status','exact')] += 1
+        if record.get('status') == 'estimated':
+            bucket['estimated_tokens'] += u['input_tokens'] + u['output_tokens']
         dollars = price(record,catalog)
         bucket['unknown'] |= dollars is None
         bucket['cost'] += dollars or 0
@@ -289,23 +649,52 @@ def write_pricing(cache, raw):
         temporary.unlink(missing_ok=True)
 
 
+def transient(error):
+    if isinstance(error,urllib.error.HTTPError):
+        return error.code in (408,429,500,502,503,504)
+    if isinstance(error,urllib.error.URLError):
+        return transient(error.reason)
+    if isinstance(error,ssl.SSLCertVerificationError):
+        return False
+    if isinstance(error,socket.gaierror):
+        return error.errno == socket.EAI_AGAIN
+    return isinstance(error,(TimeoutError,ConnectionError,http.client.IncompleteRead))
+
+
+def fetch_pricing():
+    request = urllib.request.Request('https://models.dev/api.json',headers={'User-Agent':'codex-usage'})
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request,timeout=5) as response:
+                raw = response.read()
+            data = json.loads(raw)
+            if not isinstance(data,dict):
+                raise ValueError('invalid catalog')
+            return data,raw
+        except (OSError,ValueError,http.client.HTTPException) as error:
+            if attempt or not transient(error):
+                raise
+
+
+def cached_pricing(cache, warnings):
+    warnings.append('pricing is STALE: live fetch failed')
+    try:
+        data = json.loads(cache.read_text())
+        if isinstance(data,dict):
+            date = datetime.fromtimestamp(cache.stat().st_mtime).astimezone().isoformat(timespec='seconds')
+            warnings.append(f'pricing cache date: {date}')
+            return data
+    except (OSError,ValueError,OverflowError):
+        pass  # The unavailable-pricing note below covers unusable cache data.
+    warnings.append('no usable pricing cache; cost is unknown')
+    return {}
+
+
 def load_pricing(cache, warnings):
     try:
-        request = urllib.request.Request('https://models.dev/api.json',headers={'User-Agent':'codex-usage'})
-        with urllib.request.urlopen(request,timeout=15) as response:
-            raw = response.read()
-        data = json.loads(raw)
-        if not isinstance(data,dict):
-            raise ValueError('invalid catalog')
-    except (OSError, ValueError, http.client.HTTPException):
-        warnings.append('pricing is STALE: live fetch failed')
-        try:
-            data = json.loads(cache.read_text())
-            if isinstance(data,dict):
-                return data
-        except (OSError,ValueError):
-            warnings.append('no usable pricing cache; cost is unknown')
-        return {}
+        data,raw = fetch_pricing()
+    except (OSError,ValueError,http.client.HTTPException):
+        return cached_pricing(cache,warnings)
     try:
         write_pricing(cache,raw)
     except OSError:
@@ -313,11 +702,19 @@ def load_pricing(cache, warnings):
     return data
 
 
+def diagnostic(warning):
+    if warning.startswith(('pricing ','no usable pricing','ancestry state unavailable')):
+        return f'note: {warning}'
+    return f'warning: {warning}; report may be incomplete'
+
+
 def render(buckets):
     lines = ['📊 Codex Usage (last 2 months):']
     for month,bucket in sorted(buckets.items()):
         cost = 'unknown' if bucket['unknown'] else f"${bucket['cost']:,.2f}"
         lines.append(f"• {month}: {bucket['tokens']:,} tokens, Cost: {cost}")
+        if bucket.get('estimated'):
+            lines[-1] += f" (includes {bucket['estimated_tokens']:,} estimated tokens in {bucket['estimated']} responses)"
     if not buckets:
         lines.append('• no usage in the last 2 months')
     return '\n'.join(lines)
@@ -337,7 +734,7 @@ def main():
     catalog = load_pricing(cache,warnings) if active else {}
     print(render(aggregate(records,catalog)))
     for warning in sorted(set(warnings)):
-        print(f'warning: {warning}; report may be incomplete',file=sys.stderr)
+        print(diagnostic(warning),file=sys.stderr)
     return 0
 
 
