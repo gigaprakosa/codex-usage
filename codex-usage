@@ -3,12 +3,14 @@
 import argparse
 import compression.zstd
 import json
+import http.client
 import math
 import os
 import sys
 import tempfile
 import urllib.request
 from collections import defaultdict
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
@@ -58,8 +60,11 @@ def discover(home):
 
 
 def load_rows(path, warnings):
+    return list(iter_rows(path, warnings))
+
+
+def iter_rows(path, warnings):
     opener = compression.zstd.open if path.suffix == '.zst' else open
-    rows = []
     try:
         with opener(path, 'rt', encoding='utf-8') as stream:
             for raw in stream:
@@ -75,12 +80,11 @@ def load_rows(path, warnings):
                         if kind == 'event_msg' and isinstance(payload.get('info'), dict):
                             payload['info'] = {k:v for k,v in payload['info'].items()
                                                if k in ('last_token_usage','total_token_usage')}
-                        rows.append(dict(type=kind, timestamp=row.get('timestamp'), payload=payload))
+                        yield dict(type=kind, timestamp=row.get('timestamp'), payload=payload)
                 except (ValueError, TypeError):
                     warnings.append('malformed event skipped')
-    except (OSError, UnicodeError, compression.zstd.ZstdError):
+    except (OSError, EOFError, UnicodeError, compression.zstd.ZstdError):
         warnings.append('unreadable session file skipped or partially read')
-    return rows
 
 
 def included(ident, metadata, visiting=None):
@@ -100,7 +104,7 @@ def included(ident, metadata, visiting=None):
     return isinstance(source, str) and source in CLI_SOURCES
 
 
-def candidates(rows, meta, warnings):
+def candidates(rows, meta, warnings, month_index=None):
     model = None
     previous = None
     for row in rows:
@@ -134,6 +138,8 @@ def candidates(rows, meta, warnings):
         except (ValueError, KeyError, TypeError):
             warnings.append('invalid usage timestamp skipped')
             continue
+        if month_index is not None and when.year*12 + when.month-1 not in (month_index-1,month_index):
+            continue
         if modern and (not isinstance(payload.get('response_id'), str) or not payload['response_id']):
             warnings.append('response without identity skipped')
             continue
@@ -143,21 +149,23 @@ def candidates(rows, meta, warnings):
 
 
 def read_usage(home, warnings):
+    now = datetime.now().astimezone()
+    month_index = now.year*12 + now.month-1
     sessions = []
     metadata = {}
     for path in discover(home):
-        rows = load_rows(path, warnings)
-        meta = next((r['payload'] for r in rows if r.get('type') == 'session_meta'), {})
+        with closing(iter_rows(path, warnings)) as rows:
+            meta = next((r['payload'] for r in rows if r.get('type') == 'session_meta'), {})
         ident = meta.get('id')
         if not isinstance(ident, str) or not ident:
             warnings.append('session without identity skipped')
             continue
         metadata[ident] = meta
-        sessions.append((ident, meta, rows))
+        sessions.append((ident, meta, path))
     records = []
-    for ident, meta, rows in sessions:
+    for ident, meta, path in sessions:
         if included(ident, metadata):
-            records.extend((ident, r) for r in candidates(rows, meta, warnings))
+            records.extend((ident, r) for r in candidates(iter_rows(path, warnings), meta, warnings, month_index))
         elif isinstance(meta.get('source'), dict) or meta.get('source') not in ('vscode',):
             warnings.append('unclassified session or missing ancestry excluded')
     modern = {(ident,r['snapshot']) for ident,r in records if r['modern']}
@@ -264,7 +272,7 @@ def load_pricing(cache, warnings):
         data = json.loads(raw)
         if not isinstance(data,dict):
             raise ValueError('invalid catalog')
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.IncompleteRead):
         warnings.append('pricing is STALE: live fetch failed')
         try:
             data = json.loads(cache.read_text())

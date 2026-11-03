@@ -266,3 +266,61 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(cache.read_bytes(),live)
         self.assertEqual(cache.stat().st_mode & 0o777,0o600)
         self.assertEqual(sorted(p.name for p in self.home.iterdir()),['prices.json','sessions'])
+
+class InterruptedInputTests(unittest.TestCase):
+    setUp=UsageTests.setUp
+    write=UsageTests.write
+
+    def test_truncated_archive_preserves_readable_sessions(self):
+        path=self.write('broken.jsonl.zst',session(ident='broken')+[modern('broken')],True)
+        path.write_bytes(path.read_bytes()[:-1])
+        self.write('good.jsonl',session()+[modern()])
+        warnings=[]
+        records=self.m['read_usage'](self.home,warnings)
+        self.assertIn('r',[record['response'] for record in records])
+        self.assertIn('unreadable session file skipped or partially read',warnings)
+
+    def test_incomplete_http_body_uses_cached_prices(self):
+        import http.client
+        import io
+        from unittest.mock import patch
+        class Socket:
+            def makefile(self, *args):
+                return io.BytesIO(b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{}')
+        response=http.client.HTTPResponse(Socket())
+        response.begin()
+        cache=self.home/'prices.json'
+        cache.write_text('{"cached": {"models": {}}}')
+        warnings=[]
+        with patch('urllib.request.urlopen',return_value=response):
+            self.assertIn('cached',self.m['load_pricing'](cache,warnings))
+        self.assertIn('pricing is STALE: live fetch failed',warnings)
+        self.assertEqual(cache.read_text(),'{"cached": {"models": {}}}')
+
+class ArchiveRetentionTests(unittest.TestCase):
+    setUp=UsageTests.setUp
+    write=UsageTests.write
+
+    def test_historical_usage_is_not_retained(self):
+        import tracemalloc
+        old=modern('old')
+        old['timestamp']='2020-01-01T00:00:00Z'
+        self.write('history.jsonl',session()+[old]*10000+[modern('current')])
+        tracemalloc.start()
+        try:
+            records=self.m['read_usage'](self.home,[])
+            peak=tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual([r['response'] for r in records],['current'])
+        self.assertLess(peak,2_000_000)
+
+    def test_window_filter_preserves_model_and_legacy_snapshot_state(self):
+        from unittest.mock import patch
+        old=line('event_msg',dict(type='token_count',info=dict(last_token_usage=usage(),total_token_usage=usage())), '2020-01-01T00:00:00Z')
+        repeat=line('event_msg',old['payload'])
+        self.write('history.jsonl',session()+[old,repeat,modern('current')])
+        with patch.dict(self.m['read_usage'].__globals__,datetime=type('Clock',(datetime,),{'now':staticmethod(lambda:datetime(2026,11,3,tzinfo=timezone.utc))})):
+            records=self.m['read_usage'](self.home,[])
+        self.assertEqual([r['response'] for r in records],['current'])
+        self.assertEqual(records[0]['model'],'test')

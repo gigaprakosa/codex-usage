@@ -35,6 +35,8 @@ The reader scans `sessions` and `archived_sessions` under `$CODEX_HOME`, or
 wins over its compressed sibling. Session files are opened for reading only;
 the tool does not read credentials or send session data to a service.
 Unrelated message events and unused payload fields are discarded during loading.
+An ancestry pass collects metadata first, then included sessions are streamed;
+only usage in the report window is retained for deduplication and pricing.
 
 CLI sources `cli` and `exec` are included, together with descendants whose
 parent chain reaches a CLI root. Editor sessions are excluded. Missing ancestry
@@ -54,8 +56,9 @@ Input and output counters must be present, cumulative counters must be valid,
 and response identities must be nonempty strings. Rejected current records do
 not suppress valid legacy snapshots. Malformed ancestry is excluded.
 Malformed counters, metadata, and unreadable records produce an incomplete-report warning,
-without printing transcript contents. An empty store prints no usage; missing
-session directories exit with an error.
+without printing transcript contents. Truncated compressed sessions use the same
+warning path so readable sessions still contribute. An empty store prints no
+usage; missing session directories exit with an error.
 
 The formats follow the upstream
 [Codex protocol](https://github.com/openai/codex/blob/main/codex-rs/protocol/src/protocol.rs)
@@ -77,8 +80,8 @@ Explicit zero prices remain zero. These are current API-equivalent estimates,
 not historical invoices, subscription charges, or quota consumption.
 
 A successful fetch updates `~/.cache/codex-usage/models-dev.json`. If the network
-fails, a usable cache supplies stale prices with a warning on stderr. Without
-usable prices, cost is unknown. Cache-write failures warn without discarding
+fails, including an interrupted HTTP response body, a usable cache supplies
+stale prices with a warning on stderr. Without usable prices, cost is unknown. Cache-write failures warn without discarding
 live pricing. Cache updates use a private temporary sibling and atomic replacement
 so a failed write preserves the previous offline catalog. The pricing cache and
 its temporary sibling are the only data files this tool writes.
