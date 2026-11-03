@@ -89,19 +89,20 @@ def iter_rows(path, warnings):
 
 def included(ident, metadata, visiting=None):
     visiting = set() if visiting is None else visiting
-    if not isinstance(ident, str) or not ident or ident in visiting or ident not in metadata:
-        return False
-    visiting.add(ident)
-    meta = metadata[ident]
-    source = meta.get('source')
-    parent = meta.get('parent_thread_id')
-    if parent is None and isinstance(source, dict):
-        nested = source.get('subagent')
-        if isinstance(nested, dict) and isinstance(nested.get('thread_spawn'), dict):
-            parent = nested['thread_spawn'].get('parent_thread_id')
-    if parent is not None:
-        return included(parent, metadata, visiting)
-    return isinstance(source, str) and source in CLI_SOURCES
+    while True:
+        if not isinstance(ident, str) or not ident or ident in visiting or ident not in metadata:
+            return False
+        visiting.add(ident)
+        meta = metadata[ident]
+        source = meta.get('source')
+        parent = meta.get('parent_thread_id')
+        if parent is None and isinstance(source, dict):
+            nested = source.get('subagent')
+            if isinstance(nested, dict) and isinstance(nested.get('thread_spawn'), dict):
+                parent = nested['thread_spawn'].get('parent_thread_id')
+        if parent is None:
+            return isinstance(source, str) and source in CLI_SOURCES
+        ident = parent
 
 
 def candidates(rows, meta, warnings, month_index=None):
@@ -135,7 +136,7 @@ def candidates(rows, meta, warnings, month_index=None):
             when = stamp(row['timestamp'])
             if meta.get('forked_from_id') and when < stamp(meta['timestamp']):
                 continue
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, OverflowError):
             warnings.append('invalid usage timestamp skipped')
             continue
         if month_index is not None and when.year*12 + when.month-1 not in (month_index-1,month_index):

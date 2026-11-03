@@ -40,7 +40,9 @@ only usage in the report window is retained for deduplication and pricing.
 
 CLI sources `cli` and `exec` are included, together with descendants whose
 parent chain reaches a CLI root. Editor sessions are excluded. Missing ancestry
-or unknown sources produce a warning rather than guessing the origin.
+or unknown sources produce a warning rather than guessing the origin. Parent
+chains are walked iteratively, so deep ancestry does not depend on Python's
+recursion limit; cycles remain excluded.
 
 Current `token_usage_record.usage` records take precedence over matching legacy
 `token_count` snapshots. Response IDs prevent duplicate current records;
@@ -57,7 +59,8 @@ and response identities must be nonempty strings. Rejected current records do
 not suppress valid legacy snapshots. Malformed ancestry is excluded.
 Malformed counters, metadata, and unreadable records produce an incomplete-report warning,
 without printing transcript contents. Truncated compressed sessions use the same
-warning path so readable sessions still contribute. An empty store prints no
+warning path so readable sessions still contribute. Timestamps that overflow
+during local timezone conversion are skipped with an invalid-timestamp warning. An empty store prints no
 usage; missing session directories exit with an error.
 
 The formats follow the upstream

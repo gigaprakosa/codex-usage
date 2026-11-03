@@ -345,3 +345,42 @@ class FixtureClockTests(unittest.TestCase):
                     self.assertEqual([r['response'] for r in records],['r'])
                 finally:
                     fixture.doCleanups()
+
+
+class TimestampOverflowTests(unittest.TestCase):
+    setUp=UsageTests.setUp
+    write=UsageTests.write
+
+    def test_overflowing_timestamps_preserve_readable_usage(self):
+        for field in ('usage','fork'):
+            with self.subTest(field=field):
+                rows=session(ident='bad')+[modern('bad')]
+                if field=='usage':
+                    rows[-1]['timestamp']='9999-12-31T23:59:59-14:00'
+                else:
+                    rows[0]['payload'].update(forked_from_id='parent',timestamp='9999-12-31T23:59:59-14:00')
+                self.write('bad.jsonl',rows)
+                self.write('good.jsonl',session()+[modern()])
+                warnings=[]
+                records=self.m['read_usage'](self.home,warnings)
+                self.assertEqual([r['response'] for r in records],['r'])
+                self.assertIn('invalid usage timestamp skipped',warnings)
+
+
+class DeepAncestryTests(unittest.TestCase):
+    def test_deep_ancestry_preserves_source_and_cycle_rules(self):
+        import sys
+        module=runpy.run_path(str(SCRIPT))
+        metadata={'root':dict(source='cli')}
+        parent='root'
+        for index in range(sys.getrecursionlimit()+100):
+            ident=str(index)
+            metadata[ident]=dict(source={'subagent':{'thread_spawn':{'parent_thread_id':parent}}})
+            parent=ident
+        self.assertTrue(module['included'](parent,metadata))
+        metadata['root']['source']='vscode'
+        self.assertFalse(module['included'](parent,metadata))
+        metadata['root']=dict(parent_thread_id=parent,source='cli')
+        self.assertFalse(module['included'](parent,metadata))
+        del metadata['root']
+        self.assertFalse(module['included'](parent,metadata))
