@@ -42,7 +42,8 @@ CLI sources `cli` and `exec` are included, together with descendants whose
 parent chain reaches a CLI root. Editor sessions are excluded. Missing ancestry
 or unknown sources produce a warning rather than guessing the origin. Parent
 chains are walked iteratively, so deep ancestry does not depend on Python's
-recursion limit; cycles remain excluded.
+recursion limit; cycles remain excluded. Inclusion decisions for shared ancestors
+are reused within each report after metadata collection.
 
 Current `token_usage_record.usage` records take precedence over matching legacy
 `token_count` snapshots. Response IDs prevent duplicate current records;
@@ -80,12 +81,13 @@ Cost uses uncached input, cached reads, cache writes, and output at their
 respective per-million-token rates. Reasoning adds no separate output charge.
 A missing required rate or model makes the month's entire cost `unknown`.
 Oversized numeric rates, tier thresholds, and overflowing cost arithmetic also
-produce unknown cost without discarding tokens. Explicit zero prices remain zero.
+produce unknown cost without discarding tokens, including overflow when finite
+record costs are added to a monthly total. Explicit zero prices remain zero.
 These are current API-equivalent estimates,
 not historical invoices, subscription charges, or quota consumption.
 
 A successful fetch updates `~/.cache/codex-usage/models-dev.json`. If the network
-fails, including an interrupted HTTP response body, a usable cache supplies
+fails, including malformed HTTP responses or an interrupted response body, a usable cache supplies
 stale prices with a warning on stderr. Without usable prices, cost is unknown. Cache-write failures warn without discarding
 live pricing. Cache updates use a private temporary sibling and atomic replacement
 so a failed write preserves the previous offline catalog. The pricing cache and

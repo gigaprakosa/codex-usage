@@ -412,3 +412,85 @@ class OversizedPricingTests(unittest.TestCase):
                 result=module['aggregate']([record],catalog,datetime(2026,11,3,tzinfo=timezone.utc))
                 self.assertEqual(result['2026-11']['tokens'],10**400+30)
                 self.assertTrue(result['2026-11']['unknown'])
+
+
+class ProtocolFailureTests(unittest.TestCase):
+    setUp=UsageTests.setUp
+    write=UsageTests.write
+
+    def test_malformed_http_status_preserves_cached_report(self):
+        import http.client
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        from unittest.mock import patch
+        class Socket:
+            def makefile(self, *args):
+                return io.BytesIO(b'NOT HTTP\r\n\r\n')
+        def fetch(*args, **kwargs):
+            response=http.client.HTTPResponse(Socket())
+            response.begin()
+            return response
+        self.write('current.jsonl',session()+[modern()])
+        cache=self.home/'.cache/codex-usage/models-dev.json'
+        cache.parent.mkdir(parents=True)
+        cache.write_text(json.dumps({'openai':{'models':{'test':{'cost':dict(input=2,output=10,cache_read=1,cache_write=3)}}}}))
+        out,err=io.StringIO(),io.StringIO()
+        with patch('urllib.request.urlopen',side_effect=fetch), patch('pathlib.Path.home',return_value=self.home), patch.dict('os.environ',CODEX_HOME=str(self.home)), patch('sys.argv',['codex-usage']), redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(self.m['main'](),0)
+        self.assertIn('130 tokens, Cost: $0.00',out.getvalue())
+        self.assertIn('pricing is STALE: live fetch failed',err.getvalue())
+
+
+class AncestryReuseTests(unittest.TestCase):
+    setUp=UsageTests.setUp
+    write=UsageTests.write
+
+    def test_reader_reuses_ancestry_without_cross_report_cache(self):
+        from unittest.mock import patch
+        self.write('0000.jsonl',session()+[modern()])
+        for index in range(1,81):
+            parent='root' if index==1 else str(index-1)
+            self.write(f'{index:04}.jsonl',session(ident=str(index),parent=parent)+[modern(str(index))])
+        original=self.m['iter_rows']
+        visits=[]
+        class Metadata(dict):
+            def get(self, key, default=None):
+                if key=='parent_thread_id':
+                    visits.append(key)
+                return super().get(key,default)
+        def rows(path,warnings):
+            for row in original(path,warnings):
+                if row['type']=='session_meta':
+                    row['payload']=Metadata(row['payload'])
+                yield row
+        with patch.dict(self.m['read_usage'].__globals__,iter_rows=rows):
+            self.assertEqual(len(self.m['read_usage'](self.home,[])),81)
+            self.assertLessEqual(len(visits),162)
+            self.write('0000.jsonl',session('vscode')+[modern()])
+            self.assertEqual(self.m['read_usage'](self.home,[]),[])
+            self.write('0000.jsonl',session(parent='80')+[modern()])
+            self.assertEqual(self.m['read_usage'](self.home,[]),[])
+            self.write('0000.jsonl',session(parent='missing')+[modern()])
+            self.assertEqual(self.m['read_usage'](self.home,[]),[])
+
+
+class MonthlyOverflowTests(unittest.TestCase):
+    def test_finite_record_costs_overflow_to_unknown_month(self):
+        module=runpy.run_path(str(SCRIPT))
+        record=dict(timestamp='2026-11-01T00:00:00Z',provider='openai',model='test',
+                    usage=dict(input_tokens=1_000_000,output_tokens=0))
+        catalog={'openai':{'models':{'test':{'cost':dict(input=10**308)}}}}
+        self.assertEqual(module['price'](record,catalog),1e308)
+        result=module['aggregate']([record,record],catalog,datetime(2026,11,3,tzinfo=timezone.utc))
+        self.assertEqual(result['2026-11']['tokens'],2_000_000)
+        self.assertIn('Cost: unknown',module['render'](result))
+
+    def test_finite_month_and_zero_cost_remain_known(self):
+        module=runpy.run_path(str(SCRIPT))
+        record=dict(timestamp='2026-11-01T00:00:00Z',provider='openai',model='test',
+                    usage=dict(input_tokens=1_000_000,output_tokens=0))
+        for rate,want in ((2,'Cost: $2.00'),(0,'Cost: $0.00')):
+            with self.subTest(rate=rate):
+                catalog={'openai':{'models':{'test':{'cost':dict(input=rate)}}}}
+                result=module['aggregate']([record],catalog,datetime(2026,11,3,tzinfo=timezone.utc))
+                self.assertIn(want,module['render'](result))
