@@ -79,7 +79,9 @@ above their stated thresholds.
 Cost uses uncached input, cached reads, cache writes, and output at their
 respective per-million-token rates. Reasoning adds no separate output charge.
 A missing required rate or model makes the month's entire cost `unknown`.
-Explicit zero prices remain zero. These are current API-equivalent estimates,
+Oversized numeric rates, tier thresholds, and overflowing cost arithmetic also
+produce unknown cost without discarding tokens. Explicit zero prices remain zero.
+These are current API-equivalent estimates,
 not historical invoices, subscription charges, or quota consumption.
 
 A successful fetch updates `~/.cache/codex-usage/models-dev.json`. If the network

@@ -182,6 +182,13 @@ def read_usage(home, warnings):
     return out
 
 
+def valid_price_number(value):
+    try:
+        return type(value) in (int,float) and math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
 def select_rate(cost, input_tokens):
     rate = dict(cost)
     applicable = []
@@ -197,7 +204,7 @@ def select_rate(cost, input_tokens):
         size = rule.get('size')
         if rule.get('type') != 'context' or type(size) not in (int,float):
             return None
-        if not math.isfinite(size) or size < 0:
+        if not valid_price_number(size):
             return None
         if input_tokens > rule['size']:
             applicable.append((rule['size'],tier))
@@ -230,10 +237,17 @@ def price(record, catalog):
         if not count:
             continue
         value = rate.get(key)
-        if type(value) not in (int,float) or not math.isfinite(value) or value < 0:
+        if not valid_price_number(value):
             return None
-        total += count * value
-    return total / 1_000_000
+        try:
+            total += count * value
+        except OverflowError:
+            return None
+    try:
+        dollars = total / 1_000_000
+    except OverflowError:
+        return None
+    return dollars if math.isfinite(dollars) else None
 
 
 def aggregate(records, catalog, now=None):

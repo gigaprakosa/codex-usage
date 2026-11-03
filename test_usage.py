@@ -384,3 +384,31 @@ class DeepAncestryTests(unittest.TestCase):
         self.assertFalse(module['included'](parent,metadata))
         del metadata['root']
         self.assertFalse(module['included'](parent,metadata))
+
+
+class OversizedPricingTests(unittest.TestCase):
+    def test_oversized_rates_and_tiers_preserve_tokens_with_unknown_cost(self):
+        module=runpy.run_path(str(SCRIPT))
+        record=dict(timestamp='2026-11-01T00:00:00Z',provider='openai',model='test',usage=usage())
+        for cost in (dict(input=10**400,output=1,cache_read=1,cache_write=1),
+                     dict(input=-1,output=1,cache_read=1,cache_write=1),
+                     dict(input=1,output=1,cache_read=1,cache_write=1,
+                          tiers=[dict(input=2,tier=dict(type='context',size=10**400))]),
+                     dict(input=1e308,output=1,cache_read=1,cache_write=1)):
+            with self.subTest(cost=cost):
+                catalog={'openai':{'models':{'test':{'cost':cost}}}}
+                result=module['aggregate']([record],catalog,datetime(2026,11,3,tzinfo=timezone.utc))
+                self.assertEqual(result['2026-11']['tokens'],130)
+                self.assertTrue(result['2026-11']['unknown'])
+                self.assertIn('Cost: unknown',module['render'](result))
+
+    def test_oversized_token_arithmetic_preserves_unknown_cost(self):
+        module=runpy.run_path(str(SCRIPT))
+        record=dict(timestamp='2026-11-01T00:00:00Z',provider='openai',model='test',usage=usage(10**400))
+        for rate in (1.0,1):
+            with self.subTest(rate=rate):
+                cost=dict(input=rate,output=1,cache_read=1,cache_write=1)
+                catalog={'openai':{'models':{'test':{'cost':cost}}}}
+                result=module['aggregate']([record],catalog,datetime(2026,11,3,tzinfo=timezone.utc))
+                self.assertEqual(result['2026-11']['tokens'],10**400+30)
+                self.assertTrue(result['2026-11']['unknown'])
